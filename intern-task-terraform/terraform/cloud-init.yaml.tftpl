@@ -1,0 +1,60 @@
+#cloud-config
+
+# Non root admin user with passwordless sudo. Listing users without "default"
+# means the stock ubuntu user is not created.
+users:
+  - name: ${admin_user}
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+%{ if ssh_public_key != "" ~}
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+%{ endif ~}
+
+package_update: true
+packages:
+  - docker.io
+  - ufw
+
+# The real intern-task-app build context, embedded from the other task's folder.
+write_files:
+  - path: /opt/intern-task-app/Dockerfile
+    encoding: b64
+    content: ${dockerfile_b64}
+  - path: /opt/intern-task-app/app/app.py
+    encoding: b64
+    content: ${app_py_b64}
+  - path: /etc/systemd/system/intern-task-app.service
+    content: |
+      [Unit]
+      Description=intern-task-app container
+      Requires=docker.service
+      After=docker.service network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Restart=always
+      RestartSec=5
+      ExecStartPre=-/usr/bin/docker rm -f intern-task-app
+      # Host networking: no Docker NAT or DOCKER iptables chains, so the
+      # app's port is governed by ufw like any other host port.
+      ExecStart=/usr/bin/docker run --rm --name intern-task-app --network host intern-task-app:local
+      ExecStop=/usr/bin/docker stop intern-task-app
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Host firewall: deny all inbound except the app port, plus SSH from the
+  # same single CIDR the security group allows.
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow from ${ssh_cidr} to any port 22 proto tcp
+  - ufw allow ${app_port}/tcp
+  - ufw --force enable
+  - systemctl enable --now docker
+  - usermod -aG docker ${admin_user}
+  - docker build -t intern-task-app:local /opt/intern-task-app
+  - systemctl daemon-reload
+  - systemctl enable --now intern-task-app.service
